@@ -123,7 +123,11 @@ export class PiRpcProcess {
   static async spawn(params: SpawnParams): Promise<PiRpcProcess> {
     const cmd = params.piCommand ?? 'pi'
 
-    const args = ['--mode', 'rpc']
+    // Speed/robustness for ACP:
+    // - themes are irrelevant in rpc mode and can be noisy/slow to load.
+    // Keep extensions + prompt templates enabled because ACP users may rely on them
+    // (e.g. MCP extensions, prompt templates for workflows).
+    const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
 
     const child = spawn(cmd, args, {

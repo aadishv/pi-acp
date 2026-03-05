@@ -178,14 +178,31 @@ export class PiAcpAgent implements ACPAgent {
       piCommand: process.env.PI_ACP_PI_COMMAND
     })
 
+    // Fetch state + models once (parallel) to reduce startup latency.
+    let state: any = null
+    let availableModels: any = null
+
+    await Promise.all([
+      session.proc
+        .getState()
+        .then(s => {
+          state = s as any
+        })
+        .catch(() => {
+          state = null
+        }),
+      session.proc
+        .getAvailableModels()
+        .then(m => {
+          availableModels = m as any
+        })
+        .catch(() => {
+          availableModels = null
+        })
+    ])
+
     // Proactive auth gate: if pi has no models available, it's effectively unauthenticated.
-    let rawModelsCount = 0
-    try {
-      const data = (await session.proc.getAvailableModels()) as any
-      rawModelsCount = Array.isArray(data?.models) ? data.models.length : 0
-    } catch {
-      // ignore
-    }
+    const rawModelsCount = Array.isArray(availableModels?.models) ? availableModels.models.length : 0
 
     if (rawModelsCount === 0) {
       try {
@@ -199,8 +216,8 @@ export class PiAcpAgent implements ACPAgent {
       )
     }
 
-    const models = await getModelState(session.proc)
-    const thinking = await getThinkingState(session.proc)
+    const models = await getModelState(session.proc, { state, availableModels })
+    const thinking = await getThinkingState(session.proc, { state })
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -1009,7 +1026,10 @@ function isThinkingLevel(x: string): x is ThinkingLevel {
   return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
 }
 
-async function getThinkingState(proc: PiRpcProcess): Promise<{
+async function getThinkingState(
+  proc: PiRpcProcess,
+  pre?: { state?: any | null }
+): Promise<{
   availableModes: Array<{
     id: string
     name: string
@@ -1019,13 +1039,17 @@ async function getThinkingState(proc: PiRpcProcess): Promise<{
 }> {
   // Ask pi for current thinking level.
   let current: ThinkingLevel = 'medium'
-  try {
-    const state = (await proc.getState()) as any
-    const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
-    if (tl && isThinkingLevel(tl)) current = tl
-  } catch {
-    // ignore
-  }
+
+  const state = pre?.state ?? (await (async () => {
+    try {
+      return (await proc.getState()) as any
+    } catch {
+      return null
+    }
+  })())
+
+  const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
+  if (tl && isThinkingLevel(tl)) current = tl
 
   const available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
 
@@ -1039,45 +1063,56 @@ async function getThinkingState(proc: PiRpcProcess): Promise<{
   }
 }
 
-async function getModelState(proc: PiRpcProcess): Promise<{
+async function getModelState(
+  proc: PiRpcProcess,
+  pre?: { state?: any | null; availableModels?: any | null }
+): Promise<{
   availableModels: ModelInfo[]
   currentModelId: string
 } | null> {
   // Ask pi for available models.
   let availableModels: ModelInfo[] = []
-  try {
-    const data = (await proc.getAvailableModels()) as any
-    const models: any[] = Array.isArray(data?.models) ? data.models : []
-    availableModels = models
-      .map(m => {
-        const provider = String(m?.provider ?? '').trim()
-        const id = String(m?.id ?? '').trim()
-        if (!provider || !id) return null
 
-        const name = String(m?.name ?? id)
-        return {
-          modelId: `${provider}/${id}`,
-          name: `${provider}/${name}`,
-          description: null
-        } satisfies ModelInfo
-      })
-      .filter(Boolean) as ModelInfo[]
-  } catch {
-    // ignore
-  }
+  const data = pre?.availableModels ?? (await (async () => {
+    try {
+      return (await proc.getAvailableModels()) as any
+    } catch {
+      return null
+    }
+  })())
+
+  const models: any[] = Array.isArray(data?.models) ? data.models : []
+  availableModels = models
+    .map(m => {
+      const provider = String(m?.provider ?? '').trim()
+      const id = String(m?.id ?? '').trim()
+      if (!provider || !id) return null
+
+      const name = String(m?.name ?? id)
+      return {
+        modelId: `${provider}/${id}`,
+        name: `${provider}/${name}`,
+        description: null
+      } satisfies ModelInfo
+    })
+    .filter(Boolean) as ModelInfo[]
 
   // Ask pi what model is currently active.
   let currentModelId: string | null = null
-  try {
-    const state = (await proc.getState()) as any
-    const model = state?.model
-    if (model && typeof model === 'object') {
-      const provider = String((model as any).provider ?? '').trim()
-      const id = String((model as any).id ?? '').trim()
-      if (provider && id) currentModelId = `${provider}/${id}`
+
+  const state = pre?.state ?? (await (async () => {
+    try {
+      return (await proc.getState()) as any
+    } catch {
+      return null
     }
-  } catch {
-    // ignore
+  })())
+
+  const model = state?.model
+  if (model && typeof model === 'object') {
+    const provider = String((model as any).provider ?? '').trim()
+    const id = String((model as any).id ?? '').trim()
+    if (provider && id) currentModelId = `${provider}/${id}`
   }
 
   if (!availableModels.length && !currentModelId) return null

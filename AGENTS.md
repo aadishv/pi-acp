@@ -58,6 +58,7 @@ For real validation, test with an ACP client (e.g. Zed external agent).
 - Prefer small translation functions (pi event → ACP session/update) with unit tests.
 - Be strict about streaming and process cleanup (handle exit, drain stdout/stderr, timeouts).
 - Avoid producing unnecessary comments! Use comments sparingly to explain non-obvious decisions, not to narrate code.
+- Avoid using `any` in TypeScript; prefer explicit types and interfaces. Only use `any` when absolutely necessary (e.g. for untyped external data).
 
 ## Source control
 
@@ -69,5 +70,4 @@ For real validation, test with an ACP client (e.g. Zed external agent).
 
 ## References
 
-- ACP spec: https://agentclientprotocol.com/get-started/introduction
-- Local ACP repo with docs: `~/Dev/learning/agent-client-protocol`
+- Local ACP repo with protocol documentation and specs: `~/Dev/learning/agent-client-protocol`

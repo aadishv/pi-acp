@@ -212,6 +212,7 @@ export class PiAcpSession {
   sendStartupInfoIfPending(): void {
     if (this.startupInfoSent || !this.startupInfo) return
     this.startupInfoSent = true
+
     this.emit({
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: this.startupInfo }
@@ -219,16 +220,6 @@ export class PiAcpSession {
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
-    // If we have startup info pending, emit it as the first chunk of the first turn.
-    // This is more reliable than sending a standalone sessionUpdate right after session/new,
-    // because some clients won't render agent messages until a prompt occurs.
-    if (!this.startupInfoSent && this.startupInfo) {
-      this.startupInfoSent = true
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: this.startupInfo }
-      })
-    }
 
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)

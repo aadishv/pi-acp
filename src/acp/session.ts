@@ -577,6 +577,41 @@ export class PiAcpSession {
         break
       }
 
+      case 'auto_retry_start': {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: formatAutoRetryMessage(ev) } satisfies ContentBlock
+        })
+        break
+      }
+
+      case 'auto_retry_end': {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Retry finished, resuming.' } satisfies ContentBlock
+        })
+        break
+      }
+
+      case 'auto_compaction_start': {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Context nearing limit, running automatic compaction...' } satisfies ContentBlock
+        })
+        break
+      }
+
+      case 'auto_compaction_end': {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: 'Automatic compaction finished; context was summarized to continue the session.'
+          } satisfies ContentBlock
+        })
+        break
+      }
+
       case 'agent_start': {
         this.inAgentLoop = true
         break
@@ -619,6 +654,21 @@ export class PiAcpSession {
         break
     }
   }
+}
+
+function formatAutoRetryMessage(ev: PiRpcEvent): string {
+  const attempt = Number((ev as any).attempt)
+  const maxAttempts = Number((ev as any).maxAttempts)
+  const delayMs = Number((ev as any).delayMs)
+
+  if (!Number.isFinite(attempt) || !Number.isFinite(maxAttempts) || !Number.isFinite(delayMs)) {
+    return 'Retrying...'
+  }
+
+  let delaySeconds = Math.round(delayMs / 1000)
+  if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
+
+  return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
 }
 
 function toToolKind(toolName: string): ToolKind {

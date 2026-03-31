@@ -128,6 +128,214 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
 })
 
+test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'auto_retry_start', attempt: 2, maxAttempts: 5, delayMs: 2400 })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Retrying (attempt 2/5, waiting 2s)...' }
+  })
+})
+
+test('PiAcpSession: formats a positive sub-second auto_retry_start delay as waiting 1s', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 3, delayMs: 1 })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Retrying (attempt 1/3, waiting 1s)...' }
+  })
+})
+
+test('PiAcpSession: falls back to a generic retry message when auto_retry_start fields are missing or malformed', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'auto_retry_start', attempt: 'oops', maxAttempts: null, delayMs: 'bad' } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Retrying...' }
+  })
+})
+
+test('PiAcpSession: omits raw errorMessage content from surfaced auto_retry_start status text', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'auto_retry_start',
+    attempt: 1,
+    maxAttempts: 4,
+    delayMs: 1500,
+    errorMessage: 'provider overloaded: 529'
+  } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'agent_message_chunk')
+  assert.equal((conn.updates[0]!.update as any).content.text, 'Retrying (attempt 1/4, waiting 2s)...')
+  assert.equal((conn.updates[0]!.update as any).content.text.includes('provider overloaded'), false)
+})
+
+test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'auto_retry_end' } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Retry finished, resuming.' }
+  })
+})
+
+test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'auto_compaction_start' } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Context nearing limit, running automatic compaction...' }
+  })
+})
+
+test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'auto_compaction_end' } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'agent_message_chunk',
+    content: {
+      type: 'text',
+      text: 'Automatic compaction finished; context was summarized to continue the session.'
+    }
+  })
+})
+
+test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with text_delta events', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'before ' } })
+  proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 2, delayMs: 2000 } as any)
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'after' } })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(
+    conn.updates.map(u => u.update),
+    [
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'before ' } },
+      {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Retrying (attempt 1/2, waiting 2s)...' }
+      },
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'after' } }
+    ]
+  )
+})
+
 test('PiAcpSession: emits streamed tool locations from pi path args', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { BashBridgeServer, type BashBridgeExecuteRequest, type BashBridgeExecutionContext } from './bash-bridge.js'
+import { FsBridgeServer, type FsBridgeExecutionContext, type FsBridgeReadTextFileRequest, type FsBridgeWriteTextFileRequest, resolveBridgePath } from './fs-bridge.js'
 import { SessionStore } from './session-store.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
@@ -26,7 +27,10 @@ type SessionCreateParams = {
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
   supportsTerminal?: boolean
+  supportsReadTextFile?: boolean
+  supportsWriteTextFile?: boolean
   bashBridge?: BashBridgeServer
+  fsBridge?: FsBridgeServer
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -114,16 +118,18 @@ export class SessionManager {
     // Let pi manage session persistence in its default location (~/.pi/agent/sessions/...)
     // so sessions are visible to the regular `pi` CLI.
     const bashBridge = params.bashBridge ?? (params.supportsTerminal ? await BashBridgeServer.create() : undefined)
+    const fsBridge = params.fsBridge ?? ((params.supportsReadTextFile || params.supportsWriteTextFile) ? await FsBridgeServer.create() : undefined)
 
     let proc: PiRpcProcess
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         piCommand: params.piCommand,
-        bashBridgeSocketPath: bashBridge?.socketPath
+        bashBridgeSocketPath: bashBridge?.socketPath,
+        fsBridgeSocketPath: fsBridge?.socketPath
       })
     } catch (e) {
-      await bashBridge?.dispose().catch(() => undefined)
+      await Promise.allSettled([bashBridge?.dispose().catch(() => undefined), fsBridge?.dispose().catch(() => undefined)])
       if (e instanceof PiRpcSpawnError) {
         throw RequestError.internalError({ code: e.code }, e.message)
       }
@@ -152,7 +158,10 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       supportsTerminal: params.supportsTerminal ?? false,
-      bashBridge
+      supportsReadTextFile: params.supportsReadTextFile ?? false,
+      supportsWriteTextFile: params.supportsWriteTextFile ?? false,
+      bashBridge,
+      fsBridge
     })
 
     this.sessions.set(sessionId, session)
@@ -172,11 +181,12 @@ export class SessionManager {
   async getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiRpcProcess }): Promise<PiAcpSession> {
     const existing = this.sessions.get(sessionId)
     if (existing) {
-      await params.bashBridge?.dispose().catch(() => undefined)
+      await Promise.allSettled([params.bashBridge?.dispose().catch(() => undefined), params.fsBridge?.dispose().catch(() => undefined)])
       return existing
     }
 
     const bashBridge = params.bashBridge ?? (params.supportsTerminal ? await BashBridgeServer.create() : undefined)
+    const fsBridge = params.fsBridge ?? ((params.supportsReadTextFile || params.supportsWriteTextFile) ? await FsBridgeServer.create() : undefined)
 
     const session = new PiAcpSession({
       sessionId,
@@ -186,7 +196,10 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       supportsTerminal: params.supportsTerminal ?? false,
-      bashBridge
+      supportsReadTextFile: params.supportsReadTextFile ?? false,
+      supportsWriteTextFile: params.supportsWriteTextFile ?? false,
+      bashBridge,
+      fsBridge
     })
 
     this.sessions.set(sessionId, session)
@@ -230,7 +243,10 @@ export class PiAcpSession {
   private editSnapshots = new Map<string, { path: string; oldText: string }>()
   private bashTerminals = new Map<string, BashTerminalExecution>()
   private readonly supportsTerminal: boolean
+  private readonly supportsReadTextFile: boolean
+  private readonly supportsWriteTextFile: boolean
   private readonly bashBridge?: BashBridgeServer
+  private readonly fsBridge?: FsBridgeServer
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -263,7 +279,10 @@ export class PiAcpSession {
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     supportsTerminal?: boolean
+    supportsReadTextFile?: boolean
+    supportsWriteTextFile?: boolean
     bashBridge?: BashBridgeServer
+    fsBridge?: FsBridgeServer
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -272,17 +291,29 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.supportsTerminal = opts.supportsTerminal ?? false
+    this.supportsReadTextFile = opts.supportsReadTextFile ?? false
+    this.supportsWriteTextFile = opts.supportsWriteTextFile ?? false
     this.bashBridge = opts.bashBridge
+    this.fsBridge = opts.fsBridge
 
     debugLog('session:construct', {
       sessionId: this.sessionId,
       cwd: this.cwd,
       supportsTerminal: this.supportsTerminal,
-      bashBridgeSocketPath: this.bashBridge?.socketPath
+      supportsReadTextFile: this.supportsReadTextFile,
+      supportsWriteTextFile: this.supportsWriteTextFile,
+      bashBridgeSocketPath: this.bashBridge?.socketPath,
+      fsBridgeSocketPath: this.fsBridge?.socketPath
     })
 
     if (this.supportsTerminal && this.bashBridge) {
       this.bashBridge.setExecutor((request, ctx) => this.executeBashTerminalRequest(request, ctx))
+    }
+    if (this.fsBridge) {
+      this.fsBridge.setExecutors({
+        readTextFile: (request, ctx) => this.executeReadTextFileRequest(request, ctx),
+        writeTextFile: (request, ctx) => this.executeWriteTextFileRequest(request, ctx)
+      })
     }
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
@@ -294,8 +325,56 @@ export class PiAcpSession {
 
     await Promise.allSettled([
       ...terminals.map(([toolCallId, execution]) => this.releaseBashTerminal(toolCallId, execution, true)),
-      this.bashBridge?.dispose() ?? Promise.resolve()
+      this.bashBridge?.dispose() ?? Promise.resolve(),
+      this.fsBridge?.dispose() ?? Promise.resolve()
     ])
+  }
+
+  private async executeReadTextFileRequest(request: FsBridgeReadTextFileRequest, ctx: FsBridgeExecutionContext): Promise<void> {
+    if (!this.supportsReadTextFile) {
+      ctx.sendError('ACP read_text_file support is unavailable for this session')
+      return
+    }
+    if (ctx.signal.aborted) {
+      ctx.sendError('Operation aborted')
+      return
+    }
+
+    try {
+      const path = resolveBridgePath(request.path, request.cwd ?? this.cwd)
+      const response = await this.conn.readTextFile({
+        sessionId: this.sessionId,
+        path,
+        ...(typeof request.offset === 'number' ? { line: request.offset } : {}),
+        ...(typeof request.limit === 'number' ? { limit: request.limit } : {})
+      })
+      ctx.sendResult({ content: response.content })
+    } catch (error) {
+      ctx.sendError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  private async executeWriteTextFileRequest(request: FsBridgeWriteTextFileRequest, ctx: FsBridgeExecutionContext): Promise<void> {
+    if (!this.supportsWriteTextFile) {
+      ctx.sendError('ACP write_text_file support is unavailable for this session')
+      return
+    }
+    if (ctx.signal.aborted) {
+      ctx.sendError('Operation aborted')
+      return
+    }
+
+    try {
+      const path = resolveBridgePath(request.path, request.cwd ?? this.cwd)
+      await this.conn.writeTextFile({
+        sessionId: this.sessionId,
+        path,
+        content: request.content
+      })
+      ctx.sendResult({ path, bytesWritten: Buffer.byteLength(request.content, 'utf8') })
+    } catch (error) {
+      ctx.sendError(error instanceof Error ? error.message : String(error))
+    }
   }
 
   private async executeBashTerminalRequest(request: BashBridgeExecuteRequest, ctx: BashBridgeExecutionContext): Promise<void> {

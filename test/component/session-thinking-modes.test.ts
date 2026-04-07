@@ -10,11 +10,13 @@ class FakeConn {
   }
 }
 
-test('PiAcpAgent: initialize advertises embeddedContext', async () => {
+test('PiAcpAgent: initialize advertises embeddedContext and session lifecycle capabilities', async () => {
   const agent = new PiAcpAgent(new FakeConn() as any)
   const res = await agent.initialize({ protocolVersion: 1 } as any)
 
   assert.equal(res.agentCapabilities?.promptCapabilities?.embeddedContext, true)
+  assert.deepEqual(res.agentCapabilities?.sessionCapabilities?.close, {})
+  assert.deepEqual(res.agentCapabilities?.sessionCapabilities?.resume, {})
 })
 
 test('PiAcpAgent: setSessionConfigOption maps thought_level to pi setThinkingLevel + emits config update', async () => {
@@ -120,6 +122,52 @@ test('PiAcpAgent: model config options are grouped by provider category', async 
       ]
     }
   ])
+})
+
+test('PiAcpAgent: prompt echoes userMessageId and returns usage delta', async () => {
+  const conn = new FakeConn()
+  const agent = new PiAcpAgent(conn as any)
+
+  const proc = new FakePiRpcProcess() as any
+  let statsCalls = 0
+  proc.getSessionStats = async () => {
+    statsCalls += 1
+    return statsCalls === 1
+      ? { tokens: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, total: 30 }, cost: 0, contextUsage: { contextWindow: 1000, tokens: 200 } }
+      : { tokens: { input: 15, output: 27, cacheRead: 2, cacheWrite: 1, total: 45 }, cost: 1.5, contextUsage: { contextWindow: 1000, tokens: 240 } }
+  }
+
+  ;(agent as any).sessions = {
+    get: () => ({
+      sessionId: 's1',
+      proc,
+      prompt: async () => 'end_turn',
+      wasCancelRequested: () => false
+    })
+  }
+
+  const res = await agent.prompt({
+    sessionId: 's1',
+    messageId: '550e8400-e29b-41d4-a716-446655440000',
+    prompt: [{ type: 'text', text: 'hi' }]
+  } as any)
+
+  assert.equal(res.userMessageId, '550e8400-e29b-41d4-a716-446655440000')
+  assert.deepEqual(res.usage, {
+    inputTokens: 5,
+    outputTokens: 7,
+    cachedReadTokens: 2,
+    cachedWriteTokens: 1,
+    totalTokens: 15
+  })
+
+  const usageUpdate = conn.updates.find((u: any) => u.update?.sessionUpdate === 'usage_update')
+  assert.deepEqual(usageUpdate?.update, {
+    sessionUpdate: 'usage_update',
+    size: 1000,
+    used: 240,
+    cost: { amount: 1.5, currency: 'USD' }
+  })
 })
 
 test('PiAcpAgent: setSessionMode still rejects unknown mode IDs', async () => {

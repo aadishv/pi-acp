@@ -76,6 +76,8 @@ type SpawnParams = {
   sessionPath?: string
   /** Enables the bash ACP bridge extension and passes the socket path to pi. */
   bashBridgeSocketPath?: string
+  /** Enables the ACP filesystem bridge extension and passes the socket path to pi. */
+  fsBridgeSocketPath?: string
 }
 
 function buildPiAcpBashOverrideExtensionSource(piModuleImport: string): string {
@@ -84,7 +86,7 @@ import { createConnection } from 'node:net'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createInterface } from 'node:readline'
-import { createBashTool } from ${JSON.stringify(piModuleImport)}
+import { createBashTool, createReadTool, createWriteTool } from ${JSON.stringify(piModuleImport)}
 
 function logDebug(event, data) {
   try {
@@ -96,7 +98,7 @@ function logDebug(event, data) {
   }
 }
 
-logDebug('pi-extension:loaded', { argv: process.argv, socketPath: process.env.PI_ACP_BASH_BRIDGE_SOCKET })
+logDebug('pi-extension:loaded', { argv: process.argv, bashSocketPath: process.env.PI_ACP_BASH_BRIDGE_SOCKET, fsSocketPath: process.env.PI_ACP_FS_BRIDGE_SOCKET })
 
 function formatSuccessResult(result) {
   const output = typeof result?.output === 'string' && result.output.length > 0 ? result.output : '(no output)'
@@ -125,12 +127,11 @@ function formatFailureMessage(result, timeoutSeconds) {
   return output ? \`\${output}\n\n\${suffix}\` : suffix
 }
 
-function executeViaBridge(request, signal, onUpdate) {
+function executeViaBridge(socketPath, request, signal, onUpdate) {
   return new Promise((resolve, reject) => {
-    const socketPath = process.env.PI_ACP_BASH_BRIDGE_SOCKET
-    logDebug('pi-extension:executeViaBridge:start', { toolCallId: request.toolCallId, command: request.command, socketPath })
+    logDebug('pi-extension:executeViaBridge:start', { toolCallId: request.toolCallId, type: request.type, command: request.command, path: request.path, socketPath })
     if (!socketPath) {
-      reject(new Error('PI_ACP_BASH_BRIDGE_SOCKET is not configured'))
+      reject(new Error('Bridge socket is not configured'))
       return
     }
 
@@ -185,7 +186,7 @@ function executeViaBridge(request, signal, onUpdate) {
       try {
         message = JSON.parse(line)
       } catch {
-        finishReject(new Error('Invalid bash bridge response'))
+        finishReject(new Error('Invalid bridge response'))
         return
       }
 
@@ -202,12 +203,16 @@ function executeViaBridge(request, signal, onUpdate) {
 
       if (message?.type === 'result') {
         const result = message
-        logDebug('pi-extension:result', { toolCallId: request.toolCallId, exitCode: result?.exitCode, signal: result?.signal, timedOut: result?.timedOut, cancelled: result?.cancelled })
-        if (result?.timedOut || result?.cancelled || typeof result?.signal === 'string' || (typeof result?.exitCode === 'number' && result.exitCode !== 0)) {
-          finishReject(new Error(formatFailureMessage(result, request.timeout)))
+        logDebug('pi-extension:result', { toolCallId: request.toolCallId, type: request.type, exitCode: result?.exitCode, signal: result?.signal, timedOut: result?.timedOut, cancelled: result?.cancelled })
+        if (request.type === 'bash_execute') {
+          if (result?.timedOut || result?.cancelled || typeof result?.signal === 'string' || (typeof result?.exitCode === 'number' && result.exitCode !== 0)) {
+            finishReject(new Error(formatFailureMessage(result, request.timeout)))
+            return
+          }
+          finishResolve(formatSuccessResult(result))
           return
         }
-        finishResolve(formatSuccessResult(result))
+        finishResolve(result)
         return
       }
 
@@ -228,7 +233,66 @@ function executeViaBridge(request, signal, onUpdate) {
 }
 
 export default function (pi) {
-  const originalBash = createBashTool(process.cwd())
+  const cwd = process.cwd()
+  const originalBash = createBashTool(cwd)
+  const originalRead = createReadTool(cwd)
+  const originalWrite = createWriteTool(cwd)
+
+  pi.registerTool({
+    name: 'read',
+    label: 'read',
+    description: originalRead.description,
+    parameters: originalRead.parameters,
+    prepareArguments: originalRead.prepareArguments,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      logDebug('pi-extension:read-execute', { toolCallId, path: params.path, cwd: ctx.cwd, hasSocket: Boolean(process.env.PI_ACP_FS_BRIDGE_SOCKET) })
+      try {
+        const result = await executeViaBridge(process.env.PI_ACP_FS_BRIDGE_SOCKET, {
+          type: 'read_text_file',
+          toolCallId,
+          path: params.path,
+          offset: params.offset,
+          limit: params.limit,
+          cwd: ctx.cwd
+        }, signal, onUpdate)
+        return {
+          content: [{ type: 'text', text: typeof result?.content === 'string' ? result.content : '' }]
+        }
+      } catch (error) {
+        logDebug('pi-extension:read-execute-error', { toolCallId, error: String(error?.message || error) })
+        if (process.env.PI_ACP_FS_BRIDGE_SOCKET) throw error
+        return await originalRead.execute(toolCallId, params, signal, onUpdate)
+      }
+    }
+  })
+
+  pi.registerTool({
+    name: 'write',
+    label: 'write',
+    description: originalWrite.description,
+    parameters: originalWrite.parameters,
+    prepareArguments: originalWrite.prepareArguments,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      logDebug('pi-extension:write-execute', { toolCallId, path: params.path, cwd: ctx.cwd, hasSocket: Boolean(process.env.PI_ACP_FS_BRIDGE_SOCKET) })
+      try {
+        const result = await executeViaBridge(process.env.PI_ACP_FS_BRIDGE_SOCKET, {
+          type: 'write_text_file',
+          toolCallId,
+          path: params.path,
+          content: params.content,
+          cwd: ctx.cwd
+        }, signal, onUpdate)
+        const path = typeof result?.path === 'string' ? result.path : params.path
+        return {
+          content: [{ type: 'text', text: 'Successfully wrote ' + params.content.length + ' bytes to ' + path }]
+        }
+      } catch (error) {
+        logDebug('pi-extension:write-execute-error', { toolCallId, error: String(error?.message || error) })
+        if (process.env.PI_ACP_FS_BRIDGE_SOCKET) throw error
+        return await originalWrite.execute(toolCallId, params, signal, onUpdate)
+      }
+    }
+  })
 
   pi.registerTool({
     name: 'bash',
@@ -239,7 +303,7 @@ export default function (pi) {
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       logDebug('pi-extension:bash-execute', { toolCallId, command: params.command, cwd: ctx.cwd, hasSocket: Boolean(process.env.PI_ACP_BASH_BRIDGE_SOCKET) })
       try {
-        return await executeViaBridge({
+        return await executeViaBridge(process.env.PI_ACP_BASH_BRIDGE_SOCKET, {
           type: 'bash_execute',
           toolCallId,
           command: params.command,
@@ -381,7 +445,7 @@ export class PiRpcProcess {
     // Keep extensions + prompt templates enabled because ACP users may rely on them
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
-    if (params.bashBridgeSocketPath) {
+    if (params.bashBridgeSocketPath || params.fsBridgeSocketPath) {
       args.push('-e', ensurePiAcpBashOverrideExtension(cmd))
     }
     if (params.sessionPath) args.push('--session', params.sessionPath)
@@ -391,6 +455,7 @@ export class PiRpcProcess {
       args,
       cwd: params.cwd,
       bashBridgeSocketPath: params.bashBridgeSocketPath,
+      fsBridgeSocketPath: params.fsBridgeSocketPath,
       debugLogPath: DEBUG_LOG_PATH
     })
 
@@ -400,7 +465,8 @@ export class PiRpcProcess {
       env: {
         ...process.env,
         PI_ACP_DEBUG_LOG: process.env.PI_ACP_DEBUG_LOG || DEBUG_LOG_PATH,
-        ...(params.bashBridgeSocketPath ? { PI_ACP_BASH_BRIDGE_SOCKET: params.bashBridgeSocketPath } : {})
+        ...(params.bashBridgeSocketPath ? { PI_ACP_BASH_BRIDGE_SOCKET: params.bashBridgeSocketPath } : {}),
+        ...(params.fsBridgeSocketPath ? { PI_ACP_FS_BRIDGE_SOCKET: params.fsBridgeSocketPath } : {})
       },
       shell: shouldUseShellForPiCommand(cmd)
     })

@@ -6,9 +6,21 @@ type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 export class FakeAgentSideConnection {
   readonly updates: SessionUpdateMsg[] = []
   readonly terminals: Array<{ id: string; params: unknown; killed: boolean; released: boolean; waitForExitCount: number }> = []
+  readonly textFiles = new Map<string, string>()
+  readonly writes: Array<{ sessionId: string; path: string; content: string }> = []
 
   async sessionUpdate(msg: SessionUpdateMsg): Promise<void> {
     this.updates.push(msg)
+  }
+
+  async readTextFile(params: { path: string }): Promise<{ content: string }> {
+    return { content: this.textFiles.get(params.path) ?? '' }
+  }
+
+  async writeTextFile(params: { sessionId: string; path: string; content: string }): Promise<Record<string, never>> {
+    this.textFiles.set(params.path, params.content)
+    this.writes.push(params)
+    return {}
   }
 
   async createTerminal(params: unknown): Promise<unknown> {

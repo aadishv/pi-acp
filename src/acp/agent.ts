@@ -26,6 +26,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
 import { BashBridgeServer } from './bash-bridge.js'
+import { FsBridgeServer } from './fs-bridge.js'
 import { SessionManager } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
@@ -119,6 +120,8 @@ export class PiAcpAgent implements ACPAgent {
   // Remember recent session cwd and use it as the default filter.
   private lastSessionCwd: string | null = null
   private supportsTerminal = false
+  private supportsReadTextFile = false
+  private supportsWriteTextFile = false
 
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
@@ -133,10 +136,14 @@ export class PiAcpAgent implements ACPAgent {
     // even though they implement the terminal methods. Be optimistic unless the
     // client explicitly says terminals are unsupported.
     this.supportsTerminal = (params as any)?.clientCapabilities?.terminal !== false
+    this.supportsReadTextFile = (params as any)?.clientCapabilities?.fs?.readTextFile === true
+    this.supportsWriteTextFile = (params as any)?.clientCapabilities?.fs?.writeTextFile === true
     debugLog('agent:initialize', {
       protocolVersion: requested,
       clientCapabilities: (params as any)?.clientCapabilities,
-      supportsTerminal: this.supportsTerminal
+      supportsTerminal: this.supportsTerminal,
+      supportsReadTextFile: this.supportsReadTextFile,
+      supportsWriteTextFile: this.supportsWriteTextFile
     })
 
     return {
@@ -160,7 +167,9 @@ export class PiAcpAgent implements ACPAgent {
           embeddedContext: true
         },
         sessionCapabilities: {
-          list: {}
+          list: {},
+          close: {},
+          resume: {}
         }
       }
     }
@@ -199,7 +208,9 @@ export class PiAcpAgent implements ACPAgent {
       conn: this.conn,
       fileCommands,
       piCommand: process.env.PI_ACP_PI_COMMAND,
-      supportsTerminal: this.supportsTerminal
+      supportsTerminal: this.supportsTerminal,
+      supportsReadTextFile: this.supportsReadTextFile,
+      supportsWriteTextFile: this.supportsWriteTextFile
     })
 
     debugLog('agent:newSession:created', {
@@ -781,19 +792,48 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
+    const beforeStats = await session.proc.getSessionStats().catch(() => null)
     const result = await session.prompt(message, images)
+    const afterStats = await session.proc.getSessionStats().catch(() => null)
+
+    const usage = usageDeltaFromStats(beforeStats, afterStats)
+    if (usage) {
+      const usageUpdate = usageUpdateFromStats(afterStats)
+      if (usageUpdate) {
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'usage_update',
+            ...usageUpdate
+          }
+        }).catch(() => undefined)
+      }
+    }
 
     // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
     // unless we know this was a cancellation.
     const stopReason: StopReason =
       result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
 
-    return { stopReason }
+    return {
+      stopReason,
+      ...(usage ? { usage } : {}),
+      ...(typeof params.messageId === 'string' && params.messageId ? { userMessageId: params.messageId } : {})
+    }
   }
 
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions.get(params.sessionId)
     await session.cancel()
+  }
+
+  async unstable_closeSession(params: { sessionId: string }): Promise<Record<string, never>> {
+    const session = this.sessions.maybeGet(params.sessionId)
+    if (session) {
+      await session.cancel().catch(() => undefined)
+    }
+    this.sessions.close(params.sessionId)
+    return {}
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -829,6 +869,75 @@ export class PiAcpAgent implements ACPAgent {
     return this.listSessions(params)
   }
 
+  async unstable_resumeSession(params: { sessionId: string; cwd: string; mcpServers?: any[] }): Promise<{ sessionId: string; configOptions: SessionConfigOption[]; models: any; modes: any }> {
+    if (!isAbsolute(params.cwd)) {
+      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+    }
+
+    this.sessions.close(params.sessionId)
+    this.lastSessionCwd = params.cwd
+
+    const stored = this.store.get(params.sessionId)
+    const sessionFile = stored?.sessionFile ?? findPiSessionFile(params.sessionId)
+    if (!sessionFile) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+    }
+
+    const bashBridge = this.supportsTerminal ? await BashBridgeServer.create() : undefined
+    const fsBridge = this.supportsReadTextFile || this.supportsWriteTextFile ? await FsBridgeServer.create() : undefined
+
+    let proc: PiRpcProcess
+    try {
+      proc = await PiRpcProcess.spawn({
+        cwd: params.cwd,
+        sessionPath: sessionFile,
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        bashBridgeSocketPath: bashBridge?.socketPath,
+        fsBridgeSocketPath: fsBridge?.socketPath
+      })
+    } catch (e: any) {
+      await Promise.allSettled([bashBridge?.dispose().catch(() => undefined), fsBridge?.dispose().catch(() => undefined)])
+      if (e?.name === 'PiRpcSpawnError') {
+        throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
+      }
+      throw e
+    }
+
+    const fileCommands = loadSlashCommands(params.cwd)
+    const session = await this.sessions.getOrCreate(params.sessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers ?? [],
+      conn: this.conn,
+      proc,
+      fileCommands,
+      supportsTerminal: this.supportsTerminal,
+      supportsReadTextFile: this.supportsReadTextFile,
+      supportsWriteTextFile: this.supportsWriteTextFile,
+      bashBridge,
+      fsBridge
+    })
+
+    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+
+    this.store.upsert({ sessionId: params.sessionId, cwd: params.cwd, sessionFile })
+
+    const [models, thinking] = await Promise.all([
+      getModelState(proc).catch(() => null),
+      getThinkingState(proc).catch(() => ({
+        availableModes: [{ id: 'medium', name: 'Medium', description: null }],
+        currentModeId: 'medium'
+      }))
+    ])
+    const configOptions = toSessionConfigOptions({ models, thinking })
+
+    return {
+      sessionId: session.sessionId,
+      configOptions,
+      models,
+      modes: thinking
+    }
+  }
+
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     if (!isAbsolute(params.cwd)) {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
@@ -852,6 +961,7 @@ export class PiAcpAgent implements ACPAgent {
 
     // Spawn pi and point it directly at the session file.
     const bashBridge = this.supportsTerminal ? await BashBridgeServer.create() : undefined
+    const fsBridge = this.supportsReadTextFile || this.supportsWriteTextFile ? await FsBridgeServer.create() : undefined
 
     let proc: PiRpcProcess
     try {
@@ -859,10 +969,11 @@ export class PiAcpAgent implements ACPAgent {
         cwd: params.cwd,
         sessionPath: sessionFile,
         piCommand: process.env.PI_ACP_PI_COMMAND,
-        bashBridgeSocketPath: bashBridge?.socketPath
+        bashBridgeSocketPath: bashBridge?.socketPath,
+        fsBridgeSocketPath: fsBridge?.socketPath
       })
     } catch (e: any) {
-      await bashBridge?.dispose().catch(() => undefined)
+      await Promise.allSettled([bashBridge?.dispose().catch(() => undefined), fsBridge?.dispose().catch(() => undefined)])
       if (e?.name === 'PiRpcSpawnError') {
         throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
       }
@@ -879,7 +990,10 @@ export class PiAcpAgent implements ACPAgent {
       proc,
       fileCommands,
       supportsTerminal: this.supportsTerminal,
-      bashBridge
+      supportsReadTextFile: this.supportsReadTextFile,
+      supportsWriteTextFile: this.supportsWriteTextFile,
+      bashBridge,
+      fsBridge
     })
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
@@ -1301,6 +1415,44 @@ function formatModelDescription(model: any): string | null {
   }
 
   return parts.length > 0 ? parts.join(' • ') : null
+}
+
+function usageDeltaFromStats(before: any, after: any): { inputTokens: number; outputTokens: number; cachedReadTokens?: number; cachedWriteTokens?: number; totalTokens: number } | null {
+  const beforeTokens = before?.tokens && typeof before.tokens === 'object' ? before.tokens : null
+  const afterTokens = after?.tokens && typeof after.tokens === 'object' ? after.tokens : null
+  if (!afterTokens) return null
+
+  const inputTokens = Math.max(0, Number(afterTokens.input ?? 0) - Number(beforeTokens?.input ?? 0))
+  const outputTokens = Math.max(0, Number(afterTokens.output ?? 0) - Number(beforeTokens?.output ?? 0))
+  const cachedReadTokens = Math.max(0, Number(afterTokens.cacheRead ?? 0) - Number(beforeTokens?.cacheRead ?? 0))
+  const cachedWriteTokens = Math.max(0, Number(afterTokens.cacheWrite ?? 0) - Number(beforeTokens?.cacheWrite ?? 0))
+  const totalTokens = Math.max(0, Number(afterTokens.total ?? 0) - Number(beforeTokens?.total ?? 0))
+
+  if (inputTokens === 0 && outputTokens === 0 && cachedReadTokens === 0 && cachedWriteTokens === 0 && totalTokens === 0) {
+    return null
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    ...(cachedReadTokens > 0 ? { cachedReadTokens } : {}),
+    ...(cachedWriteTokens > 0 ? { cachedWriteTokens } : {}),
+    totalTokens
+  }
+}
+
+function usageUpdateFromStats(stats: any): { size: number; used: number; cost?: { amount: number; currency: string } } | null {
+  const contextUsage = stats?.contextUsage
+  const size = Number(contextUsage?.contextWindow ?? 0)
+  const used = Number(contextUsage?.tokens ?? 0)
+  if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(used) || used < 0) return null
+
+  const costValue = Number(stats?.cost)
+  return {
+    size,
+    used,
+    ...(Number.isFinite(costValue) && costValue > 0 ? { cost: { amount: costValue, currency: 'USD' } } : {})
+  }
 }
 
 function isSemver(v: string): boolean {

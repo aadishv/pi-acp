@@ -8,6 +8,7 @@ export function toolResultToText(result: unknown): string {
       .map((c: any) => (c?.type === 'text' && typeof c.text === 'string' ? c.text : ''))
       .filter(Boolean)
     if (texts.length) return texts.join('')
+    if (content.length === 0 && (result as any)?.details == null) return ''
   }
 
   const details = (result as any)?.details

@@ -1,5 +1,10 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { existsSync, realpathSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import * as readline from 'node:readline'
+import { pathToFileURL } from 'node:url'
+import { debugLog, DEBUG_LOG_PATH } from '../debug.js'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 
 export class PiRpcSpawnError extends Error {
@@ -69,6 +74,240 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /** Enables the bash ACP bridge extension and passes the socket path to pi. */
+  bashBridgeSocketPath?: string
+}
+
+function buildPiAcpBashOverrideExtensionSource(piModuleImport: string): string {
+  return `
+import { createConnection } from 'node:net'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { createInterface } from 'node:readline'
+import { createBashTool } from ${JSON.stringify(piModuleImport)}
+
+function logDebug(event, data) {
+  try {
+    const logPath = process.env.PI_ACP_DEBUG_LOG || '/tmp/pi-acp-debug.log'
+    mkdirSync(dirname(logPath), { recursive: true })
+    appendFileSync(logPath, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, event, data }) + '\\n')
+  } catch {
+    // ignore
+  }
+}
+
+logDebug('pi-extension:loaded', { argv: process.argv, socketPath: process.env.PI_ACP_BASH_BRIDGE_SOCKET })
+
+function formatSuccessResult(result) {
+  const output = typeof result?.output === 'string' && result.output.length > 0 ? result.output : '(no output)'
+  return {
+    content: [{ type: 'text', text: output }],
+    details: {
+      exitCode: result?.exitCode ?? 0,
+      ...(result?.signal ? { signal: result.signal } : {}),
+      ...(result?.truncated ? { truncated: true } : {})
+    }
+  }
+}
+
+function formatFailureMessage(result, timeoutSeconds) {
+  const output = typeof result?.output === 'string' ? result.output.trimEnd() : ''
+  const suffix = result?.timedOut
+    ? \`Command timed out after \${timeoutSeconds ?? 'unknown'} seconds\`
+    : result?.cancelled
+      ? 'Command aborted'
+      : typeof result?.signal === 'string' && result.signal.length > 0
+        ? \`Command terminated by signal \${result.signal}\`
+        : typeof result?.exitCode === 'number'
+          ? \`Command exited with code \${result.exitCode}\`
+          : 'Command failed'
+
+  return output ? \`\${output}\n\n\${suffix}\` : suffix
+}
+
+function executeViaBridge(request, signal, onUpdate) {
+  return new Promise((resolve, reject) => {
+    const socketPath = process.env.PI_ACP_BASH_BRIDGE_SOCKET
+    logDebug('pi-extension:executeViaBridge:start', { toolCallId: request.toolCallId, command: request.command, socketPath })
+    if (!socketPath) {
+      reject(new Error('PI_ACP_BASH_BRIDGE_SOCKET is not configured'))
+      return
+    }
+
+    const socket = createConnection(socketPath)
+    const rl = createInterface({ input: socket })
+    let settled = false
+
+    const cleanup = () => {
+      rl.close()
+      socket.removeAllListeners()
+      if (signal) signal.removeEventListener('abort', onAbort)
+    }
+
+    const finishResolve = value => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(value)
+    }
+
+    const finishReject = error => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(error)
+    }
+
+    const onAbort = () => {
+      if (socket.destroyed) return
+      socket.write(JSON.stringify({ type: 'abort' }) + '\\n')
+    }
+
+    socket.once('error', error => {
+      logDebug('pi-extension:socket-error', { toolCallId: request.toolCallId, error: String(error?.message || error) })
+      finishReject(error)
+    })
+
+    rl.on('error', error => {
+      logDebug('pi-extension:readline-error', { toolCallId: request.toolCallId, error: String(error?.message || error) })
+      finishReject(error)
+    })
+
+    socket.once('connect', () => {
+      logDebug('pi-extension:socket-connect', { toolCallId: request.toolCallId })
+      socket.write(JSON.stringify(request) + '\\n')
+    })
+
+    rl.on('line', line => {
+      if (!line.trim()) return
+
+      let message
+      try {
+        message = JSON.parse(line)
+      } catch {
+        finishReject(new Error('Invalid bash bridge response'))
+        return
+      }
+
+      if (message?.type === 'update') {
+        const text = typeof message.output === 'string' ? message.output : ''
+        logDebug('pi-extension:update', { toolCallId: request.toolCallId, outputLength: text.length })
+        if (!text) return
+        onUpdate?.({
+          content: [{ type: 'text', text }],
+          details: message.truncated ? { truncated: true } : undefined
+        })
+        return
+      }
+
+      if (message?.type === 'result') {
+        const result = message
+        logDebug('pi-extension:result', { toolCallId: request.toolCallId, exitCode: result?.exitCode, signal: result?.signal, timedOut: result?.timedOut, cancelled: result?.cancelled })
+        if (result?.timedOut || result?.cancelled || typeof result?.signal === 'string' || (typeof result?.exitCode === 'number' && result.exitCode !== 0)) {
+          finishReject(new Error(formatFailureMessage(result, request.timeout)))
+          return
+        }
+        finishResolve(formatSuccessResult(result))
+        return
+      }
+
+      if (message?.type === 'error') {
+        logDebug('pi-extension:error', { toolCallId: request.toolCallId, message: message.message })
+        finishReject(new Error(typeof message.message === 'string' ? message.message : 'Bash bridge error'))
+        return
+      }
+
+      finishReject(new Error('Unknown bash bridge response'))
+    })
+
+    if (signal) {
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+    }
+  })
+}
+
+export default function (pi) {
+  const originalBash = createBashTool(process.cwd())
+
+  pi.registerTool({
+    name: 'bash',
+    label: 'bash',
+    description: originalBash.description,
+    parameters: originalBash.parameters,
+    prepareArguments: originalBash.prepareArguments,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      logDebug('pi-extension:bash-execute', { toolCallId, command: params.command, cwd: ctx.cwd, hasSocket: Boolean(process.env.PI_ACP_BASH_BRIDGE_SOCKET) })
+      try {
+        return await executeViaBridge({
+          type: 'bash_execute',
+          toolCallId,
+          command: params.command,
+          timeout: params.timeout,
+          cwd: ctx.cwd
+        }, signal, onUpdate)
+      } catch (error) {
+        logDebug('pi-extension:bash-execute-error', { toolCallId, error: String(error?.message || error) })
+        if (process.env.PI_ACP_BASH_BRIDGE_SOCKET) throw error
+        return await originalBash.execute(toolCallId, params, signal, onUpdate)
+      }
+    }
+  })
+}
+`
+}
+
+function resolvePiCliPath(cmd: string): string | null {
+  const directPath = cmd.includes('/') || cmd.includes('\\') ? cmd : null
+  const discoveredPath = directPath
+    ? directPath
+    : (() => {
+        const lookup = spawnSync(process.platform === 'win32' ? 'where' : 'which', [cmd], { encoding: 'utf8' })
+        if (lookup.status !== 0) return null
+        const first = lookup.stdout
+          .split(/\r?\n/)
+          .map(line => line.trim())
+          .find(Boolean)
+        return first ?? null
+      })()
+
+  if (!discoveredPath) return null
+
+  try {
+    return realpathSync(discoveredPath)
+  } catch {
+    return null
+  }
+}
+
+function resolvePiModuleImport(cmd: string): string | null {
+  const cliPath = resolvePiCliPath(cmd)
+  if (!cliPath) return null
+
+  const indexPath = join(dirname(cliPath), 'index.js')
+  if (!existsSync(indexPath)) return null
+  return pathToFileURL(indexPath).href
+}
+
+let piAcpBashOverrideExtensionPath: string | null = null
+let piAcpBashOverrideExtensionImport: string | null = null
+
+function ensurePiAcpBashOverrideExtension(cmd: string): string {
+  const piModuleImport = resolvePiModuleImport(cmd)
+  if (!piModuleImport) {
+    throw new PiRpcSpawnError(`Could not resolve pi module path for bash override injection (command: ${cmd}).`)
+  }
+
+  if (piAcpBashOverrideExtensionPath && piAcpBashOverrideExtensionImport === piModuleImport) {
+    return piAcpBashOverrideExtensionPath
+  }
+
+  const path = join(tmpdir(), 'pi-acp-bash-override-extension.ts')
+  writeFileSync(path, buildPiAcpBashOverrideExtensionSource(piModuleImport), 'utf8')
+  piAcpBashOverrideExtensionPath = path
+  piAcpBashOverrideExtensionImport = piModuleImport
+  debugLog('pi-rpc:write-extension', { path, piModuleImport })
+  return path
 }
 
 export class PiRpcProcess {
@@ -94,7 +333,17 @@ export class PiRpcProcess {
         return
       }
 
+      if (msg?.type === 'message_update' || msg?.type === 'tool_execution_start' || msg?.type === 'tool_execution_update' || msg?.type === 'tool_execution_end' || msg?.type === 'agent_start' || msg?.type === 'agent_end') {
+        debugLog('pi-rpc:stdout-event', {
+          type: msg?.type,
+          toolCallId: msg?.toolCallId,
+          toolName: msg?.toolName,
+          assistantMessageEventType: msg?.assistantMessageEvent?.type
+        })
+      }
+
       if (msg?.type === 'response') {
+        debugLog('pi-rpc:response', { id: msg?.id, command: msg?.command, success: msg?.success })
         const id = typeof msg.id === 'string' ? msg.id : undefined
         if (id) {
           const pending = this.pending.get(id)
@@ -110,12 +359,14 @@ export class PiRpcProcess {
     })
 
     child.on('exit', (code, signal) => {
+      debugLog('pi-rpc:exit', { code, signal })
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
     })
 
     child.on('error', err => {
+      debugLog('pi-rpc:error', { error: err })
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
     })
@@ -130,12 +381,27 @@ export class PiRpcProcess {
     // Keep extensions + prompt templates enabled because ACP users may rely on them
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
+    if (params.bashBridgeSocketPath) {
+      args.push('-e', ensurePiAcpBashOverrideExtension(cmd))
+    }
     if (params.sessionPath) args.push('--session', params.sessionPath)
+
+    debugLog('pi-rpc:spawn', {
+      cmd,
+      args,
+      cwd: params.cwd,
+      bashBridgeSocketPath: params.bashBridgeSocketPath,
+      debugLogPath: DEBUG_LOG_PATH
+    })
 
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env,
+      env: {
+        ...process.env,
+        PI_ACP_DEBUG_LOG: process.env.PI_ACP_DEBUG_LOG || DEBUG_LOG_PATH,
+        ...(params.bashBridgeSocketPath ? { PI_ACP_BASH_BRIDGE_SOCKET: params.bashBridgeSocketPath } : {})
+      },
       shell: shouldUseShellForPiCommand(cmd)
     })
 
@@ -175,7 +441,8 @@ export class PiRpcProcess {
       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e })
     }
 
-    child.stderr.on('data', () => {
+    child.stderr.on('data', chunk => {
+      debugLog('pi-rpc:stderr', { text: String(chunk) })
       // leave stderr untouched; ACP clients may capture it.
     })
 
@@ -317,6 +584,8 @@ export class PiRpcProcess {
   private request(cmd: PiRpcCommand): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
+
+    debugLog('pi-rpc:request', { type: cmd.type, id })
 
     const line = JSON.stringify(withId) + '\n'
 

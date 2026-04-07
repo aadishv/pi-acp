@@ -14,12 +14,18 @@ import {
   type NewSessionRequest,
   type PromptRequest,
   type PromptResponse,
+  type SessionConfigOption,
+  type SessionConfigSelectGroup,
+  type SessionConfigSelectOption,
   type SessionInfo,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
   type StopReason
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
+import { BashBridgeServer } from './bash-bridge.js'
 import { SessionManager } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
@@ -36,8 +42,11 @@ import type { AvailableCommand } from '@agentclientprotocol/sdk'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { hasAnyPiAuthConfigured } from '../pi-auth/status.js'
+import { debugLog } from '../debug.js'
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
+const MODEL_PROVIDER_META_KEY = 'pi-acp/provider'
 
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
@@ -109,6 +118,7 @@ export class PiAcpAgent implements ACPAgent {
 
   // Remember recent session cwd and use it as the default filter.
   private lastSessionCwd: string | null = null
+  private supportsTerminal = false
 
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
@@ -119,6 +129,15 @@ export class PiAcpAgent implements ACPAgent {
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
     const requested = params.protocolVersion
+    // Some ACP clients do not reliably advertise terminal support in initialize,
+    // even though they implement the terminal methods. Be optimistic unless the
+    // client explicitly says terminals are unsupported.
+    this.supportsTerminal = (params as any)?.clientCapabilities?.terminal !== false
+    debugLog('agent:initialize', {
+      protocolVersion: requested,
+      clientCapabilities: (params as any)?.clientCapabilities,
+      supportsTerminal: this.supportsTerminal
+    })
 
     return {
       protocolVersion: requested === supportedVersion ? requested : supportedVersion,
@@ -138,11 +157,9 @@ export class PiAcpAgent implements ACPAgent {
         promptCapabilities: {
           image: true,
           audio: false,
-          embeddedContext: false
+          embeddedContext: true
         },
         sessionCapabilities: {
-          // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
-          // Enables a native session picker in clients that support it.
           list: {}
         }
       }
@@ -170,12 +187,25 @@ export class PiAcpAgent implements ACPAgent {
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
     // Pi doesn't support mcpServers, but we accept and store.
+    debugLog('agent:newSession:start', {
+      cwd: params.cwd,
+      supportsTerminal: this.supportsTerminal,
+      mcpServers: params.mcpServers.length
+    })
+
     const session = await this.sessions.create({
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      supportsTerminal: this.supportsTerminal
+    })
+
+    debugLog('agent:newSession:created', {
+      cwd: params.cwd,
+      sessionId: session.sessionId,
+      supportsTerminal: this.supportsTerminal
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -218,6 +248,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const models = await getModelState(session.proc, { state, availableModels })
     const thinking = await getThinkingState(session.proc, { state })
+    const configOptions = toSessionConfigOptions({ models, thinking })
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -246,6 +277,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const response = {
       sessionId: session.sessionId,
+      configOptions,
       models,
       modes: thinking,
       _meta: {
@@ -764,13 +796,13 @@ export class PiAcpAgent implements ACPAgent {
     await session.cancel()
   }
 
-  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+  async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     // ACP: filter by cwd if provided.
     // Zed currently sends `{}` (no cwd), so we default to the last session cwd to
     // emulate pi's `/resume` picker (project-scoped).
     const all = listPiSessions()
 
-    const effectiveCwd = (params as any).cwd ?? this.lastSessionCwd
+    const effectiveCwd = params.cwd ?? this.lastSessionCwd
     const filtered = effectiveCwd ? all.filter(s => s.cwd === effectiveCwd) : all
 
     // Cursor-based pagination (opaque cursor). For MVP, we use a simple numeric offset.
@@ -791,6 +823,10 @@ export class PiAcpAgent implements ACPAgent {
     const nextCursor = start + PAGE_SIZE < filtered.length ? String(start + PAGE_SIZE) : null
 
     return { sessions, nextCursor, _meta: {} }
+  }
+
+  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    return this.listSessions(params)
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -815,14 +851,18 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     // Spawn pi and point it directly at the session file.
+    const bashBridge = this.supportsTerminal ? await BashBridgeServer.create() : undefined
+
     let proc: PiRpcProcess
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        bashBridgeSocketPath: bashBridge?.socketPath
       })
     } catch (e: any) {
+      await bashBridge?.dispose().catch(() => undefined)
       if (e?.name === 'PiRpcSpawnError') {
         throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
       }
@@ -832,12 +872,14 @@ export class PiAcpAgent implements ACPAgent {
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
-    const session = this.sessions.getOrCreate(params.sessionId, {
+    const session = await this.sessions.getOrCreate(params.sessionId, {
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       conn: this.conn,
       proc,
-      fileCommands
+      fileCommands,
+      supportsTerminal: this.supportsTerminal,
+      bashBridge
     })
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
@@ -919,8 +961,10 @@ export class PiAcpAgent implements ACPAgent {
 
     const models = await getModelState(proc)
     const thinking = await getThinkingState(proc)
+    const configOptions = toSessionConfigOptions({ models, thinking })
 
     const response = {
+      configOptions,
       models,
       modes: thinking,
       _meta: {
@@ -967,36 +1011,32 @@ export class PiAcpAgent implements ACPAgent {
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
     const session = this.sessions.get(params.sessionId)
+    await setSessionModel(session.proc, params.modelId)
+    await this.emitSessionConfigUpdate(session.sessionId, session.proc)
+  }
 
-    // Accept either:
-    //  - "provider/model" (preferred, matches how we advertise)
-    //  - "model" (fallback, we try to resolve via available models)
-    let provider: string | null = null
-    let modelId: string | null = null
+  async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
+    const session = this.sessions.get(params.sessionId)
 
-    if (params.modelId.includes('/')) {
-      const [p, ...rest] = params.modelId.split('/')
-      provider = p
-      modelId = rest.join('/')
-    } else {
-      modelId = params.modelId
-    }
+    switch (String(params.configId)) {
+      case 'model':
+        await setSessionModel(session.proc, String(params.value))
+        break
 
-    if (!provider) {
-      const data = (await session.proc.getAvailableModels()) as any
-      const models: any[] = Array.isArray(data?.models) ? data.models : []
-      const found = models.find(m => String(m?.id) === modelId)
-      if (found) {
-        provider = String(found.provider)
-        modelId = String(found.id)
+      case 'thought_level': {
+        const level = String(params.value)
+        if (!isThinkingLevel(level)) {
+          throw RequestError.invalidParams(`Unknown thought level: ${level}`)
+        }
+        await session.proc.setThinkingLevel(level)
+        break
       }
+
+      default:
+        throw RequestError.invalidParams(`Unknown configId: ${params.configId}`)
     }
 
-    if (!provider || !modelId) {
-      throw RequestError.invalidParams(`Unknown modelId: ${params.modelId}`)
-    }
-
-    await session.proc.setModel(provider, modelId)
+    return this.emitSessionConfigUpdate(session.sessionId, session.proc)
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1008,22 +1048,134 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     await session.proc.setThinkingLevel(mode)
+    await this.emitSessionConfigUpdate(session.sessionId, session.proc)
 
-    // Let the client know the current mode changed (keeps the dropdown in sync).
-    void this.conn.sessionUpdate({
-      sessionId: session.sessionId,
+    return {}
+  }
+
+  private async emitSessionConfigUpdate(sessionId: string, proc: PiRpcProcess): Promise<SetSessionConfigOptionResponse> {
+    const [models, thinking] = await Promise.all([getModelState(proc), getThinkingState(proc)])
+    const configOptions = toSessionConfigOptions({ models, thinking })
+
+    await this.conn.sessionUpdate({
+      sessionId,
       update: {
-        sessionUpdate: 'current_mode_update',
-        currentModeId: mode
+        sessionUpdate: 'config_option_update',
+        configOptions
       }
     })
 
-    return {}
+    await this.conn.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: 'current_mode_update',
+        currentModeId: thinking.currentModeId
+      }
+    })
+
+    return { configOptions }
   }
 }
 
 function isThinkingLevel(x: string): x is ThinkingLevel {
   return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
+}
+
+function thinkingLevelLabel(level: string): string {
+  switch (level) {
+    case 'xhigh':
+      return 'Extra high'
+    default:
+      return level.charAt(0).toUpperCase() + level.slice(1)
+  }
+}
+
+function toSessionConfigOptions(params: {
+  models: Awaited<ReturnType<typeof getModelState>>
+  thinking: Awaited<ReturnType<typeof getThinkingState>>
+}): SessionConfigOption[] {
+  const out: SessionConfigOption[] = []
+
+  if (params.models?.availableModels.length) {
+    const groups = new Map<string, SessionConfigSelectOption[]>()
+
+    for (const model of params.models.availableModels) {
+      const provider = getModelProvider(model)
+      const option = {
+        value: model.modelId,
+        name: model.name.startsWith(`${provider}/`) ? model.name.slice(provider.length + 1) : model.name,
+        description: model.description ?? null
+      } satisfies SessionConfigSelectOption
+
+      const group = groups.get(provider) ?? []
+      group.push(option)
+      groups.set(provider, group)
+    }
+
+    const groupedOptions = [...groups.entries()].map(([group, options]) => ({
+      group,
+      name: group,
+      options
+    })) satisfies SessionConfigSelectGroup[]
+
+    out.push({
+      type: 'select',
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      description: 'Select the model for this session.',
+      currentValue: params.models.currentModelId,
+      options: groupedOptions
+    })
+  }
+
+  out.push({
+    type: 'select',
+    id: 'thought_level',
+    name: 'Thinking level',
+    category: 'thought_level',
+    description: 'Select how much reasoning pi uses for this session.',
+    currentValue: params.thinking.currentModeId,
+    options: params.thinking.availableModes.map(mode => ({
+      value: mode.id,
+      name: thinkingLevelLabel(mode.id),
+      description: mode.description ?? null
+    }))
+  })
+
+  return out
+}
+
+async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Promise<void> {
+  // Accept either:
+  //  - "provider/model" (preferred, matches how we advertise)
+  //  - "model" (fallback, we try to resolve via available models)
+  let provider: string | null = null
+  let modelId: string | null = null
+
+  if (requestedModelId.includes('/')) {
+    const [p, ...rest] = requestedModelId.split('/')
+    provider = p
+    modelId = rest.join('/')
+  } else {
+    modelId = requestedModelId
+  }
+
+  if (!provider) {
+    const data = (await proc.getAvailableModels()) as any
+    const models: any[] = Array.isArray(data?.models) ? data.models : []
+    const found = models.find(m => String(m?.id) === modelId)
+    if (found) {
+      provider = String(found.provider)
+      modelId = String(found.id)
+    }
+  }
+
+  if (!provider || !modelId) {
+    throw RequestError.invalidParams(`Unknown modelId: ${requestedModelId}`)
+  }
+
+  await proc.setModel(provider, modelId)
 }
 
 async function getThinkingState(
@@ -1092,7 +1244,10 @@ async function getModelState(
       return {
         modelId: `${provider}/${id}`,
         name: `${provider}/${name}`,
-        description: null
+        description: formatModelDescription(m),
+        _meta: {
+          [MODEL_PROVIDER_META_KEY]: provider
+        }
       } satisfies ModelInfo
     })
     .filter(Boolean) as ModelInfo[]
@@ -1124,6 +1279,28 @@ async function getModelState(
     availableModels,
     currentModelId
   }
+}
+
+function getModelProvider(model: ModelInfo): string {
+  const metaProvider = model._meta?.[MODEL_PROVIDER_META_KEY]
+  if (typeof metaProvider === 'string' && metaProvider.trim()) return metaProvider.trim()
+
+  const [provider] = model.modelId.split('/')
+  return provider || 'default'
+}
+
+function formatModelDescription(model: any): string | null {
+  const parts: string[] = []
+
+  if (typeof model?.contextWindow === 'number' && Number.isFinite(model.contextWindow) && model.contextWindow > 0) {
+    parts.push(`${model.contextWindow.toLocaleString()} token context`)
+  }
+
+  if (model?.reasoning === true) {
+    parts.push('reasoning')
+  }
+
+  return parts.length > 0 ? parts.join(' • ') : null
 }
 
 function isSemver(v: string): boolean {

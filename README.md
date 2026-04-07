@@ -13,6 +13,8 @@ Expect some minor breaking changes.
 ## Features
 
 - Streams assistant output as ACP `agent_message_chunk`
+- Advertises ACP embedded context support and translates inline ACP resource blocks into pi prompt context
+- Exposes model + thinking selection via ACP `configOptions` (with `model` and `thought_level` categories), while still returning legacy `models`/`modes` for compatibility
 - Maps pi tool execution to ACP `tool_call` / `tool_call_update`
   - Tool call locations are surfaced when available for ACP clients that support opening the referenced file/context
   - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables follow-along features in clients like Zed
@@ -27,7 +29,7 @@ Expect some minor breaking changes.
   - Supports skill commands (if enabled in pi settings, they appear as `/skill:skill-name` in the ACP client)
 - Skills are loaded by pi directly and are available in ACP sessions
 - (Zed) `pi-acp` emits “startup info” block into the session (pi version, context, skills, prompts, extensions - similar to `pi` in the terminal). You can disable it by setting `quietStartup: true` in pi settings (`~/.pi/agent/settings.json` or `<project>/.pi/settings.json`). When `quietStartup` is enabled, `pi-acp` will still emit a 'New version available' message if the installed pi version is outdated.
-- (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files. Sessions can be resumed both in `pi` and in the ACP client.
+- (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files, via ACP `session/list` + `session/load`. Sessions can be resumed both in `pi` and in the ACP client.
 
 ## Prerequisites
 
@@ -134,8 +136,8 @@ Loaded from:
 
 Other built-in commands:
 
-- `/model` - maps to model selector in Zed
-- `/thinking` - maps to 'mode' selector in Zed
+- `/model` - maps to the ACP model config option in clients like Zed
+- `/thinking` - maps to the ACP thinking-level config option in clients like Zed
 - `/clear` - not implemented (use ACP client 'new' command)
 
 #### 3) Skill commands
@@ -173,7 +175,7 @@ Project layout:
 
 ## Limitations
 
-- No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally.
+- No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally, so unsaved editor buffers and ACP terminal UX are not yet available.
 - MCP servers are accepted in ACP params and stored in session state, but not wired through to pi (see [why](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/)). If you use [pi MCP adapter](https://github.com/nicobailon/pi-mcp-adapter) it will be available in the ACP client.
 - Assistant streaming is currently sent as `agent_message_chunk` (no separate thought stream).
 - Queue is implemented client-side and should work like pi's `one-at-a-time`

@@ -17,6 +17,11 @@ test('toolResultToText: prefers details.diff when present', () => {
   assert.equal(text, '--- a\n+++ b\n')
 })
 
+test('toolResultToText: returns empty string for empty content-only updates', () => {
+  const text = toolResultToText({ content: [] })
+  assert.equal(text, '')
+})
+
 test('toolResultToText: falls back to JSON', () => {
   const text = toolResultToText({ a: 1 })
   assert.match(text, /"a": 1/)

@@ -106,6 +106,102 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[2]!.update as any).status, 'completed')
 })
 
+test('PiAcpSession: keeps bash inline, shows command title, and ignores late toolcall deltas after completion', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bash', args: { command: 'pwd' } })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 't1',
+    partialResult: { content: [] }
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: '/tmp/project\ndone' }] }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_end',
+      toolCall: { id: 't1', name: 'bash', arguments: { command: 'pwd' } }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.terminals.length, 0)
+  assert.equal((conn.updates[0]!.update as any).kind, 'other')
+  assert.equal((conn.updates[0]!.update as any).title, '$ pwd')
+  assert.equal((conn.updates[1]!.update as any).content, undefined)
+  assert.equal((conn.updates[2]!.update as any).status, 'completed')
+  assert.equal(conn.updates.length, 3)
+})
+
+test('PiAcpSession: still forwards bash tool events when terminal support is enabled but the bridge never claims the tool call', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    supportsTerminal: true
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 't2', name: 'bash', arguments: { command: 'pwd' } }
+    }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't2', toolName: 'bash', args: { command: 'pwd' } })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 't2',
+    toolName: 'bash',
+    partialResult: { content: [{ type: 'text', text: '/tmp/project' }] }
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't2',
+    toolName: 'bash',
+    isError: false,
+    result: { content: [{ type: 'text', text: '/tmp/project' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.terminals.length, 0)
+  assert.equal(conn.updates.length, 4)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).toolCallId, 't2')
+  assert.equal((conn.updates[0]!.update as any).kind, 'execute')
+  assert.equal((conn.updates[0]!.update as any).status, 'pending')
+  assert.equal((conn.updates[0]!.update as any).title, '$ pwd')
+  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[1]!.update as any).status, 'in_progress')
+  assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[2]!.update as any).status, 'in_progress')
+  assert.equal(conn.updates[3]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[3]!.update as any).status, 'completed')
+})
+
 test('PiAcpSession: emits tool locations from pi path args', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

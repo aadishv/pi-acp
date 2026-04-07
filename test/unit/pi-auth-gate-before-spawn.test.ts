@@ -22,7 +22,28 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED without spawning pi when no a
 
   // Also ensure typical env vars are not set for this test.
   const savedEnv: Record<string, string | undefined> = {}
-  const keys = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY']
+  const keys = [
+    'OPENAI_API_KEY',
+    'AZURE_OPENAI_API_KEY',
+    'GEMINI_API_KEY',
+    'GROQ_API_KEY',
+    'CEREBRAS_API_KEY',
+    'XAI_API_KEY',
+    'OPENROUTER_API_KEY',
+    'AI_GATEWAY_API_KEY',
+    'ZAI_API_KEY',
+    'MISTRAL_API_KEY',
+    'MINIMAX_API_KEY',
+    'MINIMAX_CN_API_KEY',
+    'HF_TOKEN',
+    'OPENCODE_API_KEY',
+    'KIMI_API_KEY',
+    'COPILOT_GITHUB_TOKEN',
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'ANTHROPIC_OAUTH_TOKEN',
+    'ANTHROPIC_API_KEY'
+  ]
   for (const k of keys) {
     savedEnv[k] = process.env[k]
     delete process.env[k]

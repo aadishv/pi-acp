@@ -5,9 +5,35 @@ type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 
 export class FakeAgentSideConnection {
   readonly updates: SessionUpdateMsg[] = []
+  readonly terminals: Array<{ id: string; params: unknown; killed: boolean; released: boolean; waitForExitCount: number }> = []
 
   async sessionUpdate(msg: SessionUpdateMsg): Promise<void> {
     this.updates.push(msg)
+  }
+
+  async createTerminal(params: unknown): Promise<unknown> {
+    const terminal = {
+      id: `term-${this.terminals.length + 1}`,
+      params,
+      killed: false,
+      released: false,
+      waitForExitCount: 0
+    }
+    this.terminals.push(terminal)
+
+    return {
+      id: terminal.id,
+      async waitForExit() {
+        terminal.waitForExitCount += 1
+        return { exitCode: 0 }
+      },
+      async kill() {
+        terminal.killed = true
+      },
+      async release() {
+        terminal.released = true
+      }
+    }
   }
 }
 

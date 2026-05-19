@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { toolResultToText } from '../../src/acp/translate/pi-tools.js'
+import { toolResultToRawOutput, toolResultToText } from '../../src/acp/translate/pi-tools.js'
 
 test('toolResultToText: extracts text from content blocks', () => {
   const text = toolResultToText({
@@ -39,4 +39,17 @@ test('toolResultToText: extracts bash stdout/stderr from details', () => {
   assert.match(text, /stderr:/)
   assert.match(text, /warn/)
   assert.match(text, /exit code: 0/)
+})
+
+test('toolResultToRawOutput: flattens structured tool results to readable text', () => {
+  const rawOutput = toolResultToRawOutput({
+    content: [{ type: 'text', text: 'hello from read' }]
+  })
+
+  assert.equal(rawOutput, 'hello from read')
+})
+
+test('toolResultToRawOutput: omits empty structured updates', () => {
+  const rawOutput = toolResultToRawOutput({ content: [] })
+  assert.equal(rawOutput, undefined)
 })

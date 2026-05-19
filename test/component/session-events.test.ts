@@ -100,10 +100,12 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[1]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[1]!.update as any).status, 'in_progress')
+  assert.equal((conn.updates[1]!.update as any).rawOutput, 'running')
 
   assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[2]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[2]!.update as any).status, 'completed')
+  assert.equal((conn.updates[2]!.update as any).rawOutput, 'done')
 })
 
 test('PiAcpSession: keeps bash inline, shows command title, and ignores late toolcall deltas after completion', async () => {
@@ -147,6 +149,38 @@ test('PiAcpSession: keeps bash inline, shows command title, and ignores late too
   assert.equal((conn.updates[1]!.update as any).content, undefined)
   assert.equal((conn.updates[2]!.update as any).status, 'completed')
   assert.equal(conn.updates.length, 3)
+})
+
+test('PiAcpSession: updates a pending bash title once the command arrives later', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 't2', name: 'bash' }
+    }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't2', toolName: 'bash', args: { command: 'pwd' } })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).title, 'bash')
+  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[1]!.update as any).title, '$ pwd')
+  assert.equal((conn.updates[1]!.update as any).status, 'in_progress')
 })
 
 test('PiAcpSession: still forwards bash tool events when terminal support is enabled but the bridge never claims the tool call', async () => {

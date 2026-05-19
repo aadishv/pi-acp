@@ -32,7 +32,7 @@ import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { toolResultToRawOutput, toolResultToText } from './translate/pi-tools.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
@@ -278,13 +278,6 @@ export class PiAcpAgent implements ACPAgent {
 
     if (preludeText)
       session.setStartupInfo(preludeText)
-
-      // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
-      // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
-      // It does NOT affect other client windows because they run in separate agent processes.
-      //
-      // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
 
     const response = {
       sessionId: session.sessionId,
@@ -837,13 +830,20 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
-    // ACP: filter by cwd if provided.
-    // Zed currently sends `{}` (no cwd), so we default to the last session cwd to
-    // emulate pi's `/resume` picker (project-scoped).
+    // ACP: filter by cwd only when the client provides one.
+    // Otherwise, list all sessions rather than inheriting process-local state.
     const all = listPiSessions()
 
-    const effectiveCwd = params.cwd ?? this.lastSessionCwd
-    const filtered = effectiveCwd ? all.filter(s => s.cwd === effectiveCwd) : all
+    const filtered = params.cwd ? all.filter(s => s.cwd === params.cwd) : all
+
+    debugLog('agent:listSessions', {
+      requestedCwd: params.cwd ?? null,
+      lastSessionCwd: this.lastSessionCwd,
+      effectiveCwd: params.cwd ?? null,
+      totalSessions: all.length,
+      filteredSessions: filtered.length,
+      cursor: params.cursor ?? null
+    })
 
     // Cursor-based pagination (opaque cursor). For MVP, we use a simple numeric offset.
     // If cursor is invalid, treat as 0.
@@ -916,8 +916,6 @@ export class PiAcpAgent implements ACPAgent {
       bashBridge,
       fsBridge
     })
-
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
 
     this.store.upsert({ sessionId: params.sessionId, cwd: params.cwd, sessionFile })
 
@@ -996,10 +994,6 @@ export class PiAcpAgent implements ACPAgent {
       fsBridge
     })
 
-    // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
-    // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
-
     // (Optional) ensure mapping stays fresh.
     this.store.upsert({
       sessionId: params.sessionId,
@@ -1055,7 +1049,7 @@ export class PiAcpAgent implements ACPAgent {
             kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
             status: 'completed',
             rawInput: null,
-            rawOutput: m
+            rawOutput: toolResultToRawOutput(m)
           }
         })
 
@@ -1067,7 +1061,7 @@ export class PiAcpAgent implements ACPAgent {
             toolCallId,
             status: isError ? 'failed' : 'completed',
             content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
-            rawOutput: m
+            rawOutput: toolResultToRawOutput(m)
           }
         })
       }

@@ -16,7 +16,7 @@ import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/proces
 import { BashBridgeServer, type BashBridgeExecuteRequest, type BashBridgeExecutionContext } from './bash-bridge.js'
 import { FsBridgeServer, type FsBridgeExecutionContext, type FsBridgeReadTextFileRequest, type FsBridgeWriteTextFileRequest, resolveBridgePath } from './fs-bridge.js'
 import { SessionStore } from './session-store.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { toolResultToRawOutput, toolResultToText } from './translate/pi-tools.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import { debugLog } from '../debug.js'
 
@@ -831,6 +831,7 @@ export class PiAcpSession {
               this.emit({
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
+                title: formatToolCallTitle(toolName, rawInput),
                 status,
                 locations,
                 rawInput
@@ -901,6 +902,7 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call_update',
             toolCallId,
+            title: formatToolCallTitle(toolName, args),
             kind: toolName === 'bash' && this.supportsTerminal ? 'execute' : undefined,
             status: 'in_progress',
             locations,
@@ -940,7 +942,7 @@ export class PiAcpSession {
             : text
               ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
               : undefined,
-          rawOutput: bashMirror ? undefined : partial
+          rawOutput: bashMirror ? undefined : toolResultToRawOutput(partial)
         })
         break
       }
@@ -1009,7 +1011,7 @@ export class PiAcpSession {
           kind: bashMirror ? 'execute' : undefined,
           status: isError ? 'failed' : 'completed',
           content,
-          rawOutput: bashMirror ? undefined : result
+          rawOutput: bashMirror ? undefined : toolResultToRawOutput(result)
         })
 
         this.currentToolCalls.delete(toolCallId)

@@ -50,3 +50,11 @@ export function toolResultToText(result: unknown): string {
     return String(result)
   }
 }
+
+export function toolResultToRawOutput(result: unknown): string | number | boolean | undefined {
+  if (result == null) return undefined
+  if (typeof result === 'string' || typeof result === 'number' || typeof result === 'boolean') return result
+
+  const text = toolResultToText(result)
+  return text || undefined
+}

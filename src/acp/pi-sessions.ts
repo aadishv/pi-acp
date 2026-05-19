@@ -211,13 +211,17 @@ function pickUpdatedAtFromTail(tail: string): string | null {
 
 function pickFallbackTitleFromHead(path: string): string | null {
   // Fallback to first user message.
-  // NOTE: we keep this simple: read a small head chunk and parse line-by-line.
+  // NOTE: we keep this simple: read the file and only inspect the first ~2000 lines.
   try {
     const raw = readFileSync(path, { encoding: 'utf8' })
     const lines = raw.split(/\r?\n/)
+    let scanned = 0
+
     for (const line0 of lines) {
       const line = line0.trim()
       if (!line) continue
+      scanned += 1
+
       try {
         const obj = JSON.parse(line) as any
         if (obj?.type === 'message' && obj?.message?.role === 'user') {
@@ -233,9 +237,9 @@ function pickFallbackTitleFromHead(path: string): string | null {
       }
 
       // Avoid scanning extremely large files fully.
-      // If we didn't find a user message in the first ~2000 lines, give up.
+      // If we didn't find a user message in the first ~2000 non-empty lines, give up.
       // (Most sessions have it early.)
-      if (lines.length > 2000) break
+      if (scanned >= 2000) break
     }
   } catch {
     // ignore

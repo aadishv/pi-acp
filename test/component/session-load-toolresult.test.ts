@@ -46,12 +46,14 @@ test('PiAcpAgent: loadSession replays toolResult as tool_call + tool_call_update
     assert.ok(toolCall)
     assert.equal(toolCall.toolCallId, 'call_1')
     assert.equal(toolCall.title, 'bash')
+    assert.equal(toolCall.rawOutput, 'hello from bash')
 
     const toolCallUpdate = updates.find(u => u?.sessionUpdate === 'tool_call_update')
     assert.ok(toolCallUpdate)
     assert.equal(toolCallUpdate.toolCallId, 'call_1')
     assert.equal(toolCallUpdate.status, 'completed')
     assert.equal(toolCallUpdate.content?.[0]?.content?.text, 'hello from bash')
+    assert.equal(toolCallUpdate.rawOutput, 'hello from bash')
   } finally {
     PiRpcProcess.spawn = originalSpawn
   }
